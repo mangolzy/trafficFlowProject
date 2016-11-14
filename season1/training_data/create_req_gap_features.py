@@ -1,7 +1,6 @@
 #!/usr/bin/python
 #-*- coding: utf-8 -*-
 
-
 import pandas as pd
 import numpy as np
 import os
@@ -36,6 +35,23 @@ def createZoneDict(filepath):
 		if columns:
 			zone_dict[columns[0]] = columns[1]
 			zone_list.append(columns[0])
+
+# generate basic full table
+def generateFullTable(gridnum, slotnum):
+    g = range(1,gridnum+1)
+    s = range(1,slotnum+1)
+    gridDF = pd.DataFrame(data = g, columns = ['grid'])
+    slotDF = pd.DataFrame(data = s, columns = ['slot'])
+    new_df = pd.DataFrame(columns=['grid','slot'])
+
+    for w_index,w_row in gridDF.iterrows():
+        for d_index,d_row in slotDF.iterrows():
+            g_data = w_row['grid']
+            s_data = d_row['slot']
+
+            row =  pd.DataFrame([dict(grid=g_data, slot=s_data), ])
+            new_df = new_df.append(row, ignore_index=True)
+    return new_df
 
 # poi_table
 
@@ -135,22 +151,54 @@ def createTrafficDF(filepath, filename):
 	traffic['four'] = traffic['four'].map(lambda x: traffic2flow(x))
 	return traffic
 
-def createTrainingSet(order, poi, weather, traffic):
+def createTrainingSet(order, gap, poi, weather, traffic):
+	full = generateFullTable(66, 144)
+	# past three time slot's order count, gap count, and current gap count is the target
+
+	# request
+	order = order.fillna(0)
 	basic = order.groupby(['grid','slot'], as_index = False)
 	avg_price = basic['price'].agg({'avg_price':np.mean})
-	count = basic['time'].agg({'count':np.count_nonzero})
-	# order
-	orderinfo = pd.merge(avg_price, count, how = 'outer', on = ['grid','slot'])
+	slot_count = basic['time'].agg({'count':np.count_nonzero})
+	order_count = pd.merge(full, slot_count, how = 'left', on = ['grid', 'slot'])
+	order_count_price = pd.merge(order_count, avg_price, how = 'left', on = ['grid', 'slot'])
+	order_count_price.fillna(0, inplace=True)
+
+	# gap
+	gap = gap.fillna(0)
+	gap_basic = gap.groupby(['grid','slot'], as_index = False)
+	# avg_price = basic['price'].agg({'avg_price':np.mean}) i guess all is null for a gap record right?
+	gap_slot_count = gap_basic['time'].agg({'gap_count':np.count_nonzero})
+	gap_count = pd.merge(full, gap_slot_count, how = 'left', on = ['grid', 'slot'])
+	gap_count.fillna(0, inplace=True)
+	# order  /// no need to group by date because we treate each file seperately, only concatrate them in the end
+	#        /// idealy, we get 66 * (144 - 2) * 21 rows..
+	#        /// each row we consider its past three time slot, what's the avg req count, avg accept price, avg gap count
+	#        /// and what's the current gap.. so i guess we have to do the statistic on the whole set .. not only gap...
+
+	orderinfo = order_count_price
+	orderinfo['gap_count'] = gap_count['gap_count']
+	#orderinfo = pd.merge(avg_price, count, how = 'outer', on = ['grid','slot'])
 	orderinfo['avg_price_3'] = pd.rolling_mean(orderinfo['avg_price'],3).shift(1)
 	orderinfo['avg_count_3'] = pd.rolling_mean(orderinfo['count'], 3).shift(1)
+	orderinfo['avg_gap_count'] = pd.rolling_mean(orderinfo['gap_count'], 3).shift(1)
+
 	orderinfo['price_delta_1'] = orderinfo['avg_price'] / orderinfo['avg_price'].shift(1) - 1
 	orderinfo['price_delta_3'] = pd.rolling_mean(orderinfo['price_delta_1'],2).shift(1)
+
 	orderinfo['count_delta_1'] = orderinfo['count'] / orderinfo['count'].shift(1) - 1
 	orderinfo['count_delta_3'] = pd.rolling_mean(orderinfo['count_delta_1'],2).shift(1)
-	o = orderinfo.dropna(how = 'any')
-	del o['avg_price']
-	# del o['count'] predict target...
-	del o['price_delta_1']
+
+	orderinfo['gap_delta_1'] = orderinfo['gap_count'] / orderinfo['gap_count'].shift(1) - 1
+	orderinfo['gap_delta_3'] = pd.rolling_mean(orderinfo['gap_delta_1'],2).shift(1)
+
+	# o = orderinfo.dropna(how = 'any')
+	orderinfo.fillna(0, inplace = True)
+	del orderinfo['avg_price']
+    #del o['count'] # gap_count predict target...
+	del orderinfo['price_delta_1']
+	del orderinfo['count_delta_1']
+	del orderinfo['gap_delta_1']
 	# slot grid avg_price_3 avg_count_3 price_delta_3 count_delta_3
 
 	# weather
@@ -163,13 +211,13 @@ def createTrainingSet(order, poi, weather, traffic):
 	wea['min_type_3'] = pd.rolling_min(wea['wtype'],3).shift(1)
 	wea['avg_temp_3'] = pd.rolling_mean(wea['wtemp'], 3).shift(1)
 	wea['avg_pm25_3'] = pd.rolling_mean(wea['wpm25'],3).shift(1)
-	w = wea.dropna(how = 'any')
-	del w['wtype']
-	del w['wtemp']
-	del w['wpm25']
+	# w = wea.dropna(how = 'any')
+	del wea['wtype']
+	del wea['wtemp']
+	del wea['wpm25']
 	# + weather
-	orderweather = pd.merge(o, w, how = 'left', on = ['slot'])
-
+	orderweather = pd.merge(orderinfo, wea, how = 'left', on = ['slot'])
+	orderweather.fillna(0, inplace = True)
 	# + traffic  to-do  inner to avoid null 
 
 	
@@ -177,13 +225,14 @@ def createTrainingSet(order, poi, weather, traffic):
 	traffic['avg_two_3'] = pd.rolling_mean(traffic['two'], 3).shift(1)
 	traffic['avg_three_3'] = pd.rolling_mean(traffic['three'],3).shift(1)
 	traffic['avg_four_3'] = pd.rolling_mean(traffic['four'],3).shift(1)
-	t = traffic.dropna(how = 'any')
-	del t['one']
-	del t['two']
-	del t['three']
-	del t['four']
+	#t = traffic.dropna(how = 'any')
+	del traffic['one']
+	del traffic['two']
+	del traffic['three']
+	del traffic['four']
 
-	orderweathertraffic = pd.merge(orderweather, t, how = 'inner', on = ['slot','grid'])
+	orderweathertraffic = pd.merge(orderweather, traffic, how = 'left', on = ['slot','grid'])
+	orderweathertraffic.fillna(method = 'backfill', inplace = True)
 	# + poi
 	owtp = pd.merge(orderweathertraffic, poi, how = 'left', on = ['grid'])
 	
@@ -220,15 +269,16 @@ def main():
 		#weather.write_csv("./weather_data/weather_"+date)
 		#traffic.write_csv("./traffic_data/traffic_"+date)
 		#training = createTrainingSet(order, poi, weather, traffic)
-		training = createTrainingSet(gap, poi, weather, traffic)
+		training = createTrainingSet(order, gap, poi, weather, traffic)
 		frames.append(training)
 	result = pd.concat(frames)
 	result['dayOfWeek'] = pd.DatetimeIndex(result.date).dayofweek
 	print result.columns
 	print result.size / len(result.columns)
 	print len(result.columns)
+	print 66 * 144 * 21
 	# the average data of former three time slot as feature and the current slot gap count as target
-	result.to_csv("./gap_training_set_new.csv", index=False)
+	result.to_csv("./gap_training_set_req_gap_features.csv", index=False)
 
 
 
